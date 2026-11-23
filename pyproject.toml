@@ -1,0 +1,10 @@
+[project]
+name = "grokking"
+version = "0.1.0"
+description = "Grokking on modular arithmetic: serial (Z_p -> Z_q) and joint training across group sizes"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy>=1.24", "pandas>=2.0", "matplotlib>=3.7"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
