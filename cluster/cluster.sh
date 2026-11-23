@@ -103,7 +103,8 @@ case $CMD in
         done
         [[ -f "$ROOT/$CONFIG" ]] || die "no such config: $CONFIG"
         sync_code
-        extra_q=$(printf '%q ' ${EXTRA[@]+"${EXTRA[@]}"})
+        extra_q=""  # the extra args, quoted for the remote shell (printf with no args would give '')
+        [[ ${#EXTRA[@]} -gt 0 ]] && extra_q=$(printf '%q ' "${EXTRA[@]}")
         name="grok-$(basename "$CONFIG" .json)"
         for gpu in ${GPUS//,/ }; do
             id=$(remote "mkdir -p logs && sbatch --parsable --account=$ACCOUNT --time=$TIME \
