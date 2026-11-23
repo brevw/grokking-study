@@ -23,8 +23,8 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
-# Number of "=" tokens: one per task the network learns ("=A" for the first task,
-# "=B" for the second). They come right after the number tokens.
+# Number of "=" tokens: one per task the network learns ("=p" for the first task,
+# "=q" for the second). They come right after the number tokens.
 N_EQ_TOKENS = 2
 
 # --------------------------------------------------------------------------------------
@@ -48,7 +48,7 @@ class ModelConfig:
 
     @property
     def vocab_size(self) -> int:
-        """Numbers 0..n_numbers-1, then the "=" tokens "=A", "=B" (see data.py)."""
+        """Numbers 0..n_numbers-1, then the "=" tokens "=p", "=q" (see data.py)."""
         return self.n_numbers + N_EQ_TOKENS
 
 

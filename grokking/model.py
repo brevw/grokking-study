@@ -86,7 +86,7 @@ class GrokTransformer(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)  # W_E: numbers, then "=A", "=B"
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)  # W_E: numbers, then "=p", "=q"
         self.pos = nn.Parameter(torch.empty(cfg.n_ctx, cfg.d_model))  # W_pos
         self.blocks = nn.ModuleList(Block(cfg.d_model, cfg.n_heads, cfg.d_mlp) for _ in range(cfg.n_layers))
         self.unembed = nn.Linear(cfg.d_model, cfg.n_numbers, bias=False)  # W_U: number tokens only
