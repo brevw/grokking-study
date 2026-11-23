@@ -17,8 +17,9 @@ Speed: only the last position's output is ever used, so the **last block compute
 only that position**. Its query comes from the last token alone (keys and values from
 all tokens), and its MLP runs on one position instead of n_ctx. The result is exactly
 the same as running the full sequence and keeping the last position. It does about a
-third of the MLP work (the MLP is most of the FLOPs). ``tests/test_core.py`` checks that
-it is equal to the full computation.
+third of the MLP work (the MLP is most of the FLOPs). Its attention (one query, three
+keys) is written out by hand, because PyTorch's fused attention kernel is slow for such
+short sequences. ``tests/test_core.py`` checks that it is equal to the full computation.
 """
 
 from __future__ import annotations
@@ -49,19 +50,29 @@ class Attention(nn.Module):
         last_only=True:  only the last position asks a query (it may see every key).
         """
         B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
         q, k, v = self.qkv(x).split(D, dim=-1)
         if last_only:
-            q = q[:, -1:]
-        # (B, L, D) -> (B, heads, L, d_head)
-        q = q.view(B, -1, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        # softmax(q kᵀ / sqrt(d_head)) v. With last_only, the single query sits at the final
-        # position, so it may attend to all keys and no mask is needed. Do NOT use
-        # is_causal=True there: when there are fewer queries than keys, PyTorch aligns the
-        # causal mask to the top-left, and the query would only see the first key.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=not last_only)
-        return self.out(y.transpose(1, 2).reshape(B, -1, D))
+            # One query (the last position) and T = 3 keys. It sits at the final position,
+            # so it may attend to every key: no mask. Written out by hand:
+            #   score[b, t, h] = <q[b, h], k[b, t, h]> / sqrt(d_head)
+            #   y[b, h]        = sum_t softmax_t(score)[b, t, h] * v[b, t, h]
+            # This is the same math as scaled_dot_product_attention, but for T = 3 the
+            # fused PyTorch kernel is ~4x slower (forward + backward) than these few
+            # element-wise ops, which torch.compile fuses further.
+            q = q[:, -1].view(B, 1, H, dh)
+            k = k.view(B, T, H, dh)
+            v = v.view(B, T, H, dh)
+            weights = ((q * k).sum(-1) * dh**-0.5).softmax(dim=1)  # (B, T, H)
+            y = (weights.unsqueeze(-1) * v).sum(1)  # (B, H, dh)
+            return self.out(y.reshape(B, 1, D))
+        # Full causal attention over all positions (only used by earlier blocks when
+        # n_layers > 1, and by the tests). (B, T, D) -> (B, heads, T, d_head)
+        q = q.view(B, T, H, dh).transpose(1, 2)
+        k = k.view(B, T, H, dh).transpose(1, 2)
+        v = v.view(B, T, H, dh).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.out(y.transpose(1, 2).reshape(B, T, D))
 
 
 class Block(nn.Module):

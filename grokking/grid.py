@@ -5,12 +5,24 @@ warm-started conditions need the source checkpoints.
 
 Parallelism: ``workers > 1`` starts that many processes. Each process uses
 ``threads`` PyTorch threads. For these tiny models, several single-threaded
-processes are usually faster than one multi-threaded process.
+processes are usually faster than one multi-threaded process. On one GPU, 2 workers
+are enough to keep it busy.
+
+Several grid commands may work on the same experiment at the same time (e.g. two
+Slurm jobs on two GPUs, see ``cluster/``). Before running a job, a worker *claims*
+it by creating ``<run dir>/.claim`` (atomic, so only one worker wins). The others
+skip it. While the job runs, the claim file is touched every minute; a claim that
+has not been touched for 10 minutes belongs to a dead process (job killed or timed
+out) and is taken over. Transfer jobs wait for their source runs if another worker
+is still training them.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import socket
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -18,6 +30,7 @@ from pathlib import Path
 
 import torch
 
+from .conditions import CONDITIONS
 from .config import ExperimentConfig
 from .experiments import is_done, run_source, run_transfer, source_dir, transfer_dir
 
@@ -54,6 +67,69 @@ def expand_jobs(cfg: ExperimentConfig) -> list[Job]:
     return jobs
 
 
+# ---------------------------------------------------------------------- claims
+
+CLAIM = ".claim"
+HEARTBEAT_S = 60  # a running job touches its claim this often
+STALE_S = 600  # a claim untouched for this long belongs to a dead process
+
+
+def _claim_age(run_dir: Path) -> float | None:
+    """Seconds since the claim of ``run_dir`` was last touched (None = no claim)."""
+    try:
+        return time.time() - (run_dir / CLAIM).stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def is_claimed(run_dir: Path) -> bool:
+    """True if a live worker (somewhere) is running this job."""
+    age = _claim_age(run_dir)
+    return age is not None and age < STALE_S
+
+
+def try_claim(run_dir: Path) -> bool:
+    """Atomically claim a job. False if a live worker already owns it."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / CLAIM
+    age = _claim_age(run_dir)
+    if age is not None and age >= STALE_S:
+        path.unlink(missing_ok=True)  # the owner died: take over
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    owner = f"host={socket.gethostname()} pid={os.getpid()} slurm_job={os.environ.get('SLURM_JOB_ID', '-')}\n"
+    os.write(fd, owner.encode())
+    os.close(fd)
+    return True
+
+
+class _Heartbeat:
+    """Touches the claim file every HEARTBEAT_S seconds while a job runs; removes it at the end."""
+
+    def __init__(self, run_dir: Path):
+        self.path = run_dir / CLAIM
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._beat, daemon=True)
+
+    def _beat(self) -> None:
+        while not self.stop.wait(HEARTBEAT_S):
+            try:
+                self.path.touch()
+            except OSError:
+                pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join()
+        self.path.unlink(missing_ok=True)
+
+
 # ------------------------------------------------------------------- execution
 
 # Set in each worker process by _init_worker (a process pool cannot pickle closures).
@@ -67,13 +143,21 @@ def _init_worker(cfg_dict: dict, threads: int) -> None:
 
 
 def _execute(job: Job, force: bool = False, verbose: bool = False) -> tuple[Job, dict | None, str | None, float]:
-    """Run one job; never raises (errors are returned so the grid keeps going)."""
+    """Run one job; never raises (errors are returned so the grid keeps going).
+
+    Returns (job, summary, error, seconds). summary and error are both None if the
+    job was skipped because another worker owns it.
+    """
     t0 = time.time()
+    run_dir = job.out_dir(_CFG)
+    if (is_done(run_dir) and not force) or not try_claim(run_dir):
+        return job, None, None, 0.0
     try:
-        if job.kind == "source":
-            s = run_source(_CFG, job.p, job.seed, force=force, verbose=verbose)
-        else:
-            s = run_transfer(_CFG, job.p, job.q, job.condition, job.seed, force=force, verbose=verbose)
+        with _Heartbeat(run_dir):
+            if job.kind == "source":
+                s = run_source(_CFG, job.p, job.seed, force=force, verbose=verbose)
+            else:
+                s = run_transfer(_CFG, job.p, job.q, job.condition, job.seed, force=force, verbose=verbose)
         return job, s, None, time.time() - t0
     except Exception:  # noqa: BLE001 - report and continue with the other jobs
         return job, None, traceback.format_exc(), time.time() - t0
@@ -83,12 +167,34 @@ def _report(i: int, n: int, job: Job, summary: dict | None, err: str | None, dt:
     if err is not None:
         print(f"[{i:>4d}/{n}] FAILED {job.label}\n{err}", flush=True)
         return
+    if summary is None:
+        print(f"[{i:>4d}/{n}] {job.label}  skipped: done or running in another process", flush=True)
+        return
     tg = summary["T_grok"]
     status = f"T_grok={tg:>6d}" if tg is not None else f"not grokked in {summary['budget']}"
     extra = ""
     if summary.get("forgetting") is not None:
         extra = f"  forgetting={summary['forgetting']:+.2f}"
-    print(f"[{i:>4d}/{n}] {job.label}  {status}  T_mem={summary['T_mem']}{extra}  ({dt:.0f}s)", flush=True)
+    speed = f"{summary['ms_per_step']:.2f} ms/step"
+    print(f"[{i:>4d}/{n}] {job.label}  {status}  T_mem={summary['T_mem']}{extra}  ({dt:.0f}s, {speed})", flush=True)
+
+
+def _wait_for_sources(cfg: ExperimentConfig, jobs: list[Job], poll_s: int = 30) -> None:
+    """Block while another worker is still training a source run that ``jobs`` need.
+
+    A source that is neither done nor claimed (e.g. it failed) is not waited for:
+    the transfer jobs that need it will fail with a clear message.
+    """
+    needed = {(j.p, j.seed) for j in jobs if CONDITIONS[j.condition].init != "scratch"}
+    waited = False
+    while True:
+        running = [(p, s) for p, s in sorted(needed) if not is_done(source_dir(cfg, p, s)) and is_claimed(source_dir(cfg, p, s))]
+        if not running:
+            return
+        if not waited:
+            print(f"Waiting for source runs trained elsewhere: {running}", flush=True)
+            waited = True
+        time.sleep(poll_s)
 
 
 def run_jobs(
@@ -111,24 +217,25 @@ def run_jobs(
         batch = [j for j in todo if j.kind == phase]
         if not batch:
             continue
+        if phase == "transfer":
+            _wait_for_sources(cfg, batch)
         if workers <= 1:
             _init_worker(cfg.to_dict(), threads)
             results = (_execute(j, force, verbose) for j in batch)
-            for job, s, err, dt in results:
-                counter += 1
-                _report(counter, len(todo), job, s, err, dt)
-                if err:
-                    failures.append((job, err))
         else:
             ctx = mp.get_context("spawn")
-            with ctx.Pool(workers, initializer=_init_worker, initargs=(cfg.to_dict(), threads)) as pool:
-                args = [(j, force, False) for j in batch]
-                # imap_unordered: report each job as soon as it finishes.
-                for job, s, err, dt in pool.imap_unordered(_execute_star, args):
-                    counter += 1
-                    _report(counter, len(todo), job, s, err, dt)
-                    if err:
-                        failures.append((job, err))
+            pool = ctx.Pool(workers, initializer=_init_worker, initargs=(cfg.to_dict(), threads))
+            # imap_unordered: report each job as soon as it finishes. chunksize=1 so
+            # that a worker takes a new job only when it is free (load balancing).
+            results = pool.imap_unordered(_execute_star, [(j, force, False) for j in batch], chunksize=1)
+        for job, s, err, dt in results:
+            counter += 1
+            _report(counter, len(todo), job, s, err, dt)
+            if err:
+                failures.append((job, err))
+        if workers > 1:
+            pool.close()
+            pool.join()
     if failures:
         print(f"\n{len(failures)} job(s) failed; rerun the same command to retry them.", flush=True)
     return failures

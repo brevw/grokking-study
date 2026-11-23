@@ -91,6 +91,11 @@ class TrainConfig:
     # torch.compile the training forward pass: True | False | "auto".
     # "auto" = only on CUDA (NVIDIA GPUs). It is faster there, and it fails on some laptops (e.g. macOS CPU).
     compile: bool | str = "auto"
+    # Record the whole training step (forward, backward, AdamW) once as a CUDA graph
+    # and replay it: one launch per step instead of ~100. On CUDA it is much faster
+    # for these tiny models, whose steps are limited by Python overhead, not by GPU
+    # math. True | False | "auto" ("auto" = on CUDA only).
+    cuda_graph: bool | str = "auto"
     print_every: int = 0  # print progress every k steps (0 = silent)
 
 
@@ -160,8 +165,9 @@ class ExperimentConfig:
             tc: TrainConfig = getattr(self, name)
             if tc.repr_every % tc.eval_every:
                 raise ValueError(f"{name}.repr_every must be a multiple of {name}.eval_every")
-            if tc.compile not in (True, False, "auto"):
-                raise ValueError(f'{name}.compile must be true, false or "auto"')
+            for flag in ("compile", "cuda_graph"):
+                if getattr(tc, flag) not in (True, False, "auto"):
+                    raise ValueError(f'{name}.{flag} must be true, false or "auto"')
 
     # ------------------------------------------------------------- (de)serialise
 

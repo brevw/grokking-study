@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import math
 import random
 from pathlib import Path
@@ -62,7 +63,7 @@ def _to_jsonable(obj: Any) -> Any:
 def write_json(path: str | Path, data: dict[str, Any]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")  # unique: several jobs may write at once
     with open(tmp, "w") as f:
         json.dump(_to_jsonable(data), f, indent=2)
     tmp.replace(path)  # atomic: a crash never leaves a half-written summary
@@ -83,7 +84,7 @@ def write_csv(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
         for k in r:
             if k not in columns:
                 columns.append(k)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")  # unique: several jobs may write at once
     with open(tmp, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()

@@ -1,7 +1,8 @@
 """Cheap representation metrics (PROJECT_PLAN.md, Section 5.3).
 
 All functions are plain NumPy on small matrices, so they can run during training
-and offline on saved checkpoints.
+and offline on saved checkpoints. The two activation metrics (CKA, dead neurons) also
+accept torch tensors, so the large activation matrix never leaves the GPU.
 
 Notation: ``E`` is an embedding matrix with **one row per group element in element
 order** (row e = embedding of the token σ(e)). For the identity symbol map this is
@@ -116,18 +117,23 @@ def subgroup_fraction(freqs: list[int], n: int) -> float:
 # ------------------------------------------------------------- similarity, health
 
 
-def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
-    """Linear CKA (Kornblith et al., 2019) between two (n_examples, features) matrices."""
-    X = X - X.mean(axis=0)
-    Y = Y - Y.mean(axis=0)
-    hsic = np.linalg.norm(X.T @ Y) ** 2
-    norm = np.linalg.norm(X.T @ X) * np.linalg.norm(Y.T @ Y)
-    return float(hsic / norm) if norm > 0 else float("nan")
+def linear_cka(X, Y) -> float:
+    """Linear CKA (Kornblith et al., 2019) between two (n_examples, features) matrices.
+
+    ||XᵀY||²_F / (||XᵀX||_F ||YᵀY||_F) after centring each feature. Works on NumPy
+    arrays and on torch tensors (the MLP activations stay on the GPU).
+    """
+    X = X - X.mean(0)
+    Y = Y - Y.mean(0)
+    hsic = float(((X.T @ Y) ** 2).sum())
+    norm = float(((X.T @ X) ** 2).sum()) ** 0.5 * float(((Y.T @ Y) ** 2).sum()) ** 0.5
+    return hsic / norm if norm > 0 else float("nan")
 
 
-def dead_fraction(hidden: np.ndarray) -> float:
-    """Fraction of MLP neurons that are never active on any example."""
-    return float((hidden.max(axis=0) <= 0).mean())
+def dead_fraction(hidden) -> float:
+    """Fraction of MLP neurons never active on any example (NumPy array or torch tensor)."""
+    dead = (hidden <= 0).all(0)
+    return float(dead.sum()) / dead.shape[0]
 
 
 # ------------------------------------------------------------- snapshot (online)
@@ -146,11 +152,11 @@ class Reference:
     """State of the network at the start of the current run (step 0)."""
 
     E: np.ndarray  # group embedding of the primary task
-    hidden: np.ndarray  # MLP activations on all primary-task examples
+    hidden: torch.Tensor  # MLP activations on all primary-task examples (on the device)
     theta: torch.Tensor  # flat parameter vector
 
 
-def make_reference(model: GrokTransformer, task: ModularTask, hidden: np.ndarray) -> Reference:
+def make_reference(model: GrokTransformer, task: ModularTask, hidden: torch.Tensor) -> Reference:
     W = model.number_embeddings.detach().cpu().numpy()
     return Reference(E=group_embedding(W, task.symbols), hidden=hidden, theta=flat_params(model).cpu())
 
@@ -158,7 +164,7 @@ def make_reference(model: GrokTransformer, task: ModularTask, hidden: np.ndarray
 def snapshot(
     model: GrokTransformer,
     task: ModularTask,
-    hidden: np.ndarray,
+    hidden: torch.Tensor,
     ref: Reference,
     old: OldTaskInfo | None = None,
 ) -> dict:

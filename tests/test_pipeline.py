@@ -90,3 +90,19 @@ def test_phase_b_uses_a_new_equals_token(tmp_path):
     new = target_task(cfg, 7, seed=0, permute=False)  # q = p
     assert (old.tokens[:, 2] == eq_token(0, V)).all()
     assert (new.tokens[:, 2] == eq_token(1, V)).all()
+
+
+def test_claims_are_exclusive_and_expire(tmp_path):
+    """Two workers never run the same job; the claim of a dead worker is taken over."""
+    import os
+    import time
+
+    from grokking import grid
+
+    run = tmp_path / "run"
+    assert grid.try_claim(run)
+    assert not grid.try_claim(run) and grid.is_claimed(run)
+    old = time.time() - grid.STALE_S - 1
+    os.utime(run / grid.CLAIM, (old, old))  # the owner stopped touching it
+    assert not grid.is_claimed(run)
+    assert grid.try_claim(run)

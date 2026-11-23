@@ -37,41 +37,59 @@ def mask_logits(logits: torch.Tensor, moduli: torch.Tensor) -> torch.Tensor:
     return logits.masked_fill(invalid, float("-inf"))
 
 
-@torch.no_grad()
-def per_example(
-    model: torch.nn.Module,
-    tokens: torch.Tensor,
-    labels: torch.Tensor,
-    moduli: torch.Tensor,
-    return_hidden: bool = False,
-):
-    """Loss and correctness for every example (all already on the model's device)."""
-    if return_hidden:
-        logits, hidden = model(tokens, return_hidden=True)
-    else:
-        logits, hidden = model(tokens), None
-    logits = mask_logits(logits, moduli)
-    loss = F.cross_entropy(logits, labels, reduction="none")
-    correct = (logits.argmax(-1) == labels).float()
-    return loss.cpu().numpy(), correct.cpu().numpy(), (None if hidden is None else hidden.cpu().numpy())
-
-
 class TaskEvaluator:
-    """Caches a task's tensors on the device and evaluates a model on it."""
+    """Mean loss and accuracy of a model on subsets of one task, computed on the device.
 
-    def __init__(self, task: ModularTask, device: torch.device):
+    The subsets are the train split, the val split, and optional named parts of the
+    val split (e.g. ``"agree"`` -> logged as ``val_acc_agree``). All tensors are cached
+    on the device, and the result stays there: the trainer gathers the numbers of
+    every evaluator and copies them to the CPU in one go, so an evaluation costs a
+    single GPU -> CPU transfer of a few floats.
+    """
+
+    def __init__(self, task: ModularTask, device: torch.device, val_subsets: dict[str, np.ndarray] | None = None):
         self.task = task
         self.tokens = task.tokens.to(device)
         self.labels = task.labels.to(device)
         self.moduli = task.moduli.to(device)
+        train = np.zeros(task.size, dtype=bool)
+        train[task.train_idx] = True
+        val = np.zeros(task.size, dtype=bool)
+        val[task.val_idx] = True
+        subsets = {"train": train, "val": val}
+        for name, mask in (val_subsets or {}).items():
+            subsets[f"val_{name}"] = val & mask
+        self.subsets = list(subsets)
+        # (n_subsets, n_examples) 0/1 weights: one matrix product gives every subset mean.
+        self.weights = torch.tensor(np.stack(list(subsets.values())), dtype=torch.float32, device=device)
 
-    def __call__(self, model: torch.nn.Module, return_hidden: bool = False):
-        return per_example(model, self.tokens, self.labels, self.moduli, return_hidden)
+    @torch.no_grad()
+    def __call__(self, model: torch.nn.Module) -> torch.Tensor:
+        """Tensor (n_subsets, 2) on the device: (mean loss, accuracy) per subset (NaN if empty)."""
+        logits = mask_logits(model(self.tokens), self.moduli)
+        loss = F.cross_entropy(logits, self.labels, reduction="none")
+        correct = (logits.argmax(-1) == self.labels).float()
+        sums = self.weights @ torch.stack([loss, correct], dim=1)
+        return sums / self.weights.sum(1, keepdim=True)
 
+    @torch.no_grad()
+    def hidden(self, model: torch.nn.Module) -> torch.Tensor:
+        """MLP activations on every example, (n_examples, d_mlp), on the device."""
+        return model(self.tokens, return_hidden=True)[1]
 
-def masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
-    """Mean over the masked entries, NaN if the mask is empty."""
-    return float(values[mask].mean()) if mask.any() else float("nan")
+    def to_row(self, means: list[list[float]], prefix: str = "", with_loss: bool = True) -> dict:
+        """Log-row entries from ``means`` (the output of ``__call__`` as a list):
+        ``{prefix}train_loss``, ``{prefix}train_acc``, ``{prefix}val_loss``, ``{prefix}val_acc``,
+        and ``{prefix}val_acc_{name}`` for each val subset."""
+        row = {}
+        for name, (loss, acc) in zip(self.subsets, means):
+            if name in ("train", "val"):
+                if with_loss:
+                    row[f"{prefix}{name}_loss"] = loss
+                row[f"{prefix}{name}_acc"] = acc
+            else:
+                row[f"{prefix}val_acc_{name[4:]}"] = acc
+        return row
 
 
 # ------------------------------------------------------------------ timing logic

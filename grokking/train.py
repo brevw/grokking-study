@@ -34,10 +34,20 @@ import torch.nn.functional as F
 
 from .config import TrainConfig
 from .data import ModularTask
-from .metrics import SustainedCrossing, TaskEvaluator, masked_mean
+from .metrics import SustainedCrossing, TaskEvaluator
 from .model import GrokTransformer, flat_params
 from .representation import OldTaskInfo, make_reference, snapshot
 from .utils import resolve_device, write_csv, write_json
+
+
+def masked_loss(model: GrokTransformer, x: torch.Tensor, y: torch.Tensor, invalid: torch.Tensor) -> torch.Tensor:
+    """Training loss: cross-entropy over the valid answers only (``invalid`` = answer not in Z_n).
+
+    A plain function so that ``torch.compile`` can fuse the whole forward pass, the
+    mask and the cross-entropy (and their backward) into a few GPU kernels.
+    """
+    logits = model(x).masked_fill(invalid, float("-inf"))
+    return F.cross_entropy(logits, y)
 
 
 class Trainer:
@@ -76,27 +86,48 @@ class Trainer:
         self.invalid = classes[None, :] >= mod[:, None]
 
         # Evaluators keep each task's tensors on the device.
-        self.eval_primary = TaskEvaluator(primary, self.device)
+        self.eval_primary = TaskEvaluator(primary, self.device, val_subsets=self.val_masks)
         self.eval_extra = {name: TaskEvaluator(t, self.device) for name, t in self.eval_tasks.items()}
 
-        # Optional torch.compile of the training forward pass. It fuses the small
-        # kernels, which helps on GPUs. Evaluation uses the plain model.
-        use_compile = cfg.compile is True or (cfg.compile == "auto" and self.device.type == "cuda")
-        self.train_forward = torch.compile(self.model) if use_compile else self.model
-        self.compiled = use_compile
+        # GPU speed-ups (see TrainConfig): torch.compile of the training forward pass,
+        # and replaying the whole training step as one CUDA graph. Evaluation always
+        # uses the plain model (it shares the same weights).
+        on_cuda = self.device.type == "cuda"
+        self.compiled = cfg.compile is True or (cfg.compile == "auto" and on_cuda)
+        self.use_graph = cfg.cuda_graph is True or (cfg.cuda_graph == "auto" and on_cuda)
+        if self.use_graph and not on_cuda:
+            raise ValueError("cuda_graph=True needs a CUDA device")
+        if self.compiled:
+            # A worker process trains many runs with different batch shapes. Start each
+            # run from a clean compile cache: otherwise torch.compile switches to slower
+            # dynamic-shape kernels, and silently falls back to eager after 8 recompiles.
+            # Recompiling is quick (the generated kernels are cached on disk).
+            torch._dynamo.reset()
+            self.train_loss = torch.compile(masked_loss, dynamic=False)
+        else:
+            self.train_loss = masked_loss
 
         # AdamW with a short linear warm-up. A *fresh* optimiser for every run, so a
         # warm-started run differs from a scratch run only in its initial weights.
         # On CUDA the fused implementation updates all parameters in a single kernel.
+        # capturable=True keeps AdamW's step counter on the GPU, so it keeps counting
+        # inside the CUDA graph (otherwise the bias correction would be frozen).
         self.opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(cfg.beta1, cfg.beta2),
-            fused=self.device.type == "cuda",
+            fused=on_cuda,
+            capturable=self.use_graph,
         )
         warm = max(1, cfg.warmup_steps)
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: min(1.0, (s + 1) / warm))
+        # The graph bakes in the learning rate, so it is captured once the warm-up is
+        # over (lr constant from then on). The first steps run normally, on a side
+        # stream as CUDA graph capture requires.
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.capture_after = max(3, warm)
+        self.side_stream = torch.cuda.Stream(self.device) if self.use_graph else None
 
         # Online timing detectors (definitions in metrics.py).
         self.t_mem = SustainedCrossing(cfg.grok_threshold, patience=0)
@@ -110,45 +141,64 @@ class Trainer:
 
     # ------------------------------------------------------------------ steps
 
-    def _train_step(self) -> None:
-        """One full-batch AdamW step.
+    def _train_step(self, step: int) -> None:
+        """One full-batch AdamW step (``step`` = number of steps done before it).
 
         Nothing is copied back to the CPU here (no ``loss.item()``), so on a GPU the
         steps are queued without waiting. The loss is measured in ``_evaluate``.
         """
-        self.model.train()  # no dropout / batch-norm, so train() and eval() behave the same
-        logits = self.train_forward(self.x).masked_fill(self.invalid, float("-inf"))
-        loss = F.cross_entropy(logits, self.y)
-        self.opt.zero_grad(set_to_none=True)
+        if self.graph is not None:
+            self.graph.replay()  # the recorded step, on the same weight tensors
+        elif self.use_graph:
+            current = torch.cuda.current_stream(self.device)
+            self.side_stream.wait_stream(current)
+            with torch.cuda.stream(self.side_stream):
+                self._step_ops()
+            current.wait_stream(self.side_stream)
+        else:
+            self._step_ops()
+        self.sched.step()
+        if self.use_graph and self.graph is None and step + 1 >= self.capture_after:
+            self._capture()
+
+    def _step_ops(self, capturing: bool = False) -> None:
+        """Forward, masked cross-entropy, backward, AdamW update."""
+        loss = self.train_loss(self.model, self.x, self.y, self.invalid)
+        if not capturing:  # during capture the grads are already None (see _capture)
+            self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
-        self.sched.step()
 
-    def _evaluate(self, step: int) -> tuple[dict[str, Any], np.ndarray]:
-        """Behavioural metrics of the current model. Returns (log row, MLP hidden)."""
+    def _capture(self) -> None:
+        """Record one training step as a CUDA graph (nothing is executed while recording).
+
+        Grads are set to None first, so backward() allocates them inside the graph and
+        every replay overwrites them (no accumulation across steps).
+        """
+        assert self.sched.get_last_lr()[0] == self.cfg.lr, "capture only after the warm-up"
+        torch.cuda.synchronize(self.device)
+        self.opt.zero_grad(set_to_none=True)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._step_ops(capturing=True)
+
+    def _evaluate(self, step: int) -> dict[str, Any]:
+        """Behavioural metrics of the current model (one log row).
+
+        Everything is computed on the device; the numbers of all tasks are copied to
+        the CPU together, in a single transfer.
+        """
         self.model.eval()
-        t = self.primary
-        loss, correct, hidden = self.eval_primary(self.model, return_hidden=True)
-        row: dict[str, Any] = {
-            "step": step,
-            "lr": self.sched.get_last_lr()[0],
-            "train_loss": float(loss[t.train_idx].mean()),
-            "train_acc": float(correct[t.train_idx].mean()),
-            "val_loss": float(loss[t.val_idx].mean()),
-            "val_acc": float(correct[t.val_idx].mean()),
-        }
-        # Val accuracy restricted to subsets (agree / disagree / newtok).
-        val = np.zeros(t.size, dtype=bool)
-        val[t.val_idx] = True
-        for name, mask in self.val_masks.items():
-            row[f"val_acc_{name}"] = masked_mean(correct, val & mask)
-        # Other tasks (e.g. the old group, for forgetting).
-        for name, ev in self.eval_extra.items():
-            _, c, _ = ev(self.model)
-            row[f"{name}_train_acc"] = float(c[ev.task.train_idx].mean())
-            row[f"{name}_val_acc"] = float(c[ev.task.val_idx].mean())
+        evaluators = [(self.eval_primary, "", True)]
+        evaluators += [(ev, f"{name}_", False) for name, ev in self.eval_extra.items()]
+        means = torch.cat([ev(self.model) for ev, _, _ in evaluators]).tolist()
+        row: dict[str, Any] = {"step": step, "lr": self.sched.get_last_lr()[0]}
+        start = 0
+        for ev, prefix, with_loss in evaluators:
+            row.update(ev.to_row(means[start : start + len(ev.subsets)], prefix, with_loss))
+            start += len(ev.subsets)
         row["param_norm"] = float(flat_params(self.model).norm())
-        return row, hidden
+        return row
 
     def _save(self, name: str) -> None:
         path = self.out_dir / name
@@ -172,13 +222,14 @@ class Trainer:
             row = None
             is_last = step >= cfg.max_steps
             if step % cfg.eval_every == 0 or is_last:
-                row, hidden = self._evaluate(step)
-                if ref is None:  # reference = the network at the start of this run
-                    ref = make_reference(self.model, self.primary, hidden)
+                row = self._evaluate(step)
                 self._update_trackers(step, row)
 
                 stop = is_last or self._should_stop(step)
                 if step % cfg.repr_every == 0 or stop:
+                    hidden = self.eval_primary.hidden(self.model)  # stays on the device
+                    if ref is None:  # reference = the network at the start of this run (step 0)
+                        ref = make_reference(self.model, self.primary, hidden)
                     self.repr_log.append({"step": step, **snapshot(self.model, self.primary, hidden, ref, self.old)})
                     if cfg.save_checkpoints:
                         self._save(f"ckpt/step_{step}.pt")
@@ -192,7 +243,7 @@ class Trainer:
             # Optimisation step. On eval steps we also measure the effective learning
             # rate ||Δθ|| / ||θ|| of this update (Lyle et al., 2025).
             theta_before = flat_params(self.model) if row is not None else None
-            self._train_step()
+            self._train_step(step)
             if row is not None:
                 delta = flat_params(self.model) - theta_before
                 row["elr"] = float(delta.norm() / theta_before.norm())
@@ -258,6 +309,7 @@ class Trainer:
             "ms_per_step": 1000 * wall / max(1, steps_run),
             "device": str(self.device),
             "compiled": self.compiled,
+            "cuda_graph": self.use_graph,
             **self.extra_summary,
         }
         for key in ("val_acc_agree", "val_acc_disagree", "val_acc_newtok"):
