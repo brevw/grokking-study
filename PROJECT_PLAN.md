@@ -57,9 +57,10 @@ We frame this as a **continual learning** problem. The questions are whether ear
 
 Separate the **vocabulary** (symbols the network sees) from the **group** (what the symbols mean):
 
-- **Vocabulary:** one shared token set `{0, 1, …, V−1}` plus special tokens, with `V ≥ max(all moduli used)`. For example, V = 128 covers every modulus up to 127. The architecture is **identical in every run**. Tokens a task doesn't use are never seen.
-- **Equals / task tokens:** one special token **per modulus**, `=_n`. The input is the sequence `[a, b, =_n]` and the prediction is read at the last position.
-  - *Why:* without it, Z_p and Z_q give **conflicting labels for the same input** `(a, b)`. Forgetting would then be forced by definition and couldn't be measured meaningfully. With `=_p` vs `=_q` the network *could* keep both, so forgetting becomes a real measurement. (In phase B, `=_q` is a fresh, untrained token.)
+- **Vocabulary:** number tokens `{0, 1, …, V−1}` with `V ≥ max(all moduli used)` (token id = number), followed by two "=" tokens. With V = 128 that is 130 tokens, and it covers every modulus up to 127. The architecture is **identical in every run**. Tokens a task doesn't use are never seen.
+- **Equals / task tokens:** one "=" **per task**: `=p` (token V) for the first task (phase A) and `=q` (token V+1) for the second task (phase B). The input is the sequence `[a, b, =]` and the prediction is read at the last position. Example: `[3, 4, =p] → 2` in Z_5, `[3, 4, =q] → 0` in Z_7.
+  - *Why:* without it, Z_p and Z_q give **conflicting labels for the same input** `(a, b)`. Forgetting would then be forced by definition and couldn't be measured meaningfully. With `=p` vs `=q` the network *could* keep both, so forgetting becomes a real measurement.
+  - *Why per task and not per modulus:* the vocabulary does not depend on which moduli are used, and in the same-task control (Z_97 → Z_97) phase B still uses a symbol the network has never seen (`=q`), so the control really tests something.
 - **Symbol map** `σ_n : Z_n → tokens`:
   - **Identity map** (default): element `i` ↔ token `i`.
   - **Permuted map** (control for RQ3): in phase B, element `i` ↔ token `π(i)` for a random permutation `π`, drawn once per seed. The task is mathematically the same, but no token keeps its old "meaning".
@@ -124,7 +125,7 @@ Log **every 50 steps** (evaluation on the full train and val sets is cheap at th
 | Metric | Definition |
 |---|---|
 | Train / val accuracy and loss on **Z_q** | standard |
-| Val accuracy on **Z_p** (with `=_p`) during phase B | forgetting curve (RQ5) |
+| Val accuracy on **Z_p** (with `=p`) during phase B | forgetting curve (RQ5) |
 | **Agreement split** | val acc on Z_q split into pairs where `(a+b) mod p == (a+b) mod q` (old answer still right) vs. not. *Only meaningful under the identity map.* |
 | Accuracy on pairs involving **new tokens** (a or b ≥ p, when q > p) | do never-seen tokens get integrated? |
 | Step-0 accuracy on Z_q | how much of Z_q the network solves "for free" before any phase-B training |
@@ -172,7 +173,7 @@ Optional, only if everything else is done: the restricted/excluded loss of Nanda
 ## 7. Step-by-step work plan
 
 ### Step 1: Infrastructure and sanity checks (week 1)
-1. Write `data.py`: builds datasets for any `n`, any symbol map `σ_n`, with `=_n` tokens and a seeded split.
+1. Write `data.py`: builds datasets for any `n`, any symbol map `σ_n`, with the `=p` / `=q` tokens and a seeded split.
 2. Write `model.py`: the 1-layer transformer of Section 3.3 with a fixed vocabulary V = 128 + specials.
 3. Write `train.py`: one function `train(init_weights_or_None, task_config, budget, log_every=50, ckpt_every=500)` that logs every metric of Section 5.1 to a CSV/JSON (or Weights & Biases).
 4. **Reproduce standard grokking** on Z_97 (α = 0.3, wd = 1): train acc → 100% within ~1k steps, val acc jumps later. Measure wall-clock per step, then **recompute the compute budget from that number**.
