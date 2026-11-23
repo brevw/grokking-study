@@ -1,0 +1,12 @@
+# Python bytecode and test cache (regenerated automatically)
+__pycache__/
+.pytest_cache/
+
+# Virtual environment (recreate with: pip install -r requirements.txt)
+.venv/
+
+# Experiment outputs: logs, figures and model checkpoints (regenerate with run.py)
+results/
+
+# macOS folder metadata
+.DS_Store
