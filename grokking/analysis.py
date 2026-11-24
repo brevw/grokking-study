@@ -151,6 +151,52 @@ class Results:
                 out[col + "_med" if col.startswith("forgetting") else col] = g[col].median()
         return _order_conditions(out.reset_index())
 
+    def representation_table(self) -> pd.DataFrame:
+        """Per (p, q, condition): representation at the end of phase B, with chance levels.
+
+        * ``freq_match_end``: mean distance of the new key frequencies k'/q to the closest
+          old one k/p (0 = the old circles were re-used, rescaled to Z_q).
+          ``freq_match_chance``: the same for a uniformly random frequency k' in 1..q//2
+          (exact expectation, using each seed's own source frequencies).
+        * ``old_r2_start`` / ``old_r2_end``: how much of the token embeddings 0..p-1 the
+          old Z_p circles explain at the start / end of phase B.
+        * ``subgroup_frac_end`` vs ``subgroup_chance``: fraction of key frequencies with
+          gcd(k, q) > 1, and that fraction among all frequencies 1..q//2 (RQ4).
+        """
+        rep = self.repr_logs()
+        if rep.empty:
+            return pd.DataFrame()
+        rep = rep.sort_values("step")
+        keys = ["p", "q", "condition", "seed"]
+        first, last = rep.groupby(keys).head(1).set_index(keys), rep.groupby(keys).tail(1).set_index(keys)
+        df = pd.DataFrame({"freq_match_end": last.get("freq_match_dist"), "old_r2_start": first.get("old_freq_r2"),
+                           "old_r2_end": last.get("old_freq_r2"), "subgroup_frac_end": last["subgroup_frac"]})
+        df = df.reset_index()
+
+        src = self.sources.set_index(["p", "seed"]) if len(self.sources) else None
+
+        def chance(row) -> float:
+            if src is None or (row.p, row.seed) not in src.index:
+                return float("nan")
+            old = [int(k) for k in str(src.loc[(row.p, row.seed), "final_key_freqs"]).split(";") if k.strip()]
+            if not old:
+                return float("nan")
+            old = np.array(old) / row.p
+            return float(np.mean([np.min(np.abs(old - k / row.q)) for k in range(1, row.q // 2 + 1)]))
+
+        df["freq_match_chance"] = df.apply(chance, axis=1)
+        df["subgroup_chance"] = df["q"].map(lambda q: np.mean([math.gcd(k, q) > 1 for k in range(1, q // 2 + 1)]))
+        out = df.groupby(["p", "q", "condition"]).agg(
+            n=("seed", "size"),
+            freq_match_end=("freq_match_end", "median"),
+            freq_match_chance=("freq_match_chance", "median"),
+            old_r2_start=("old_r2_start", "median"),
+            old_r2_end=("old_r2_end", "median"),
+            subgroup_frac_end=("subgroup_frac_end", "median"),
+            subgroup_chance=("subgroup_chance", "first"),
+        )
+        return _order_conditions(out.reset_index())
+
     def progress_table(self) -> pd.DataFrame:
         """Transfer vs. how far phase A had progressed (the warm_progress_XX conditions).
 
@@ -285,12 +331,19 @@ class Results:
             if len(pt):
                 parts += ["", "--- Transfer vs. progress of phase A (0 = scratch, final = grokked + clean-up) ---",
                           pt.to_string(index=False, float_format=lambda x: f"{x:.3g}")]
+            rpt = self.representation_table()
+            if len(rpt):
+                parts += ["", "--- Representation at the end of phase B (medians; *_chance = random frequencies) ---",
+                          rpt.to_string(index=False, float_format=lambda x: f"{x:.3g}")]
             if save:
                 ct.to_csv(self.exp_dir / "table_conditions.csv", index=False)
                 rt.to_csv(self.exp_dir / "table_ratios.csv", index=False)
                 if len(pt):
                     pt.to_csv(self.exp_dir / "table_progress.csv", index=False)
+                if len(rpt):
+                    rpt.to_csv(self.exp_dir / "table_representation.csv", index=False)
         if save:
             self.summaries.to_csv(self.exp_dir / "runs.csv", index=False)
-            parts += ["", f"Tables written to {self.exp_dir}/(runs|table_conditions|table_ratios|table_progress).csv"]
+            parts += ["", f"Tables written to {self.exp_dir}/(runs|table_conditions|table_ratios|table_progress"
+                          "|table_representation).csv"]
         return "\n".join(parts)

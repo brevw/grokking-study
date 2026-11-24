@@ -300,6 +300,10 @@ def plot_subgroup_frequencies(res: Results, out: Path) -> Path | None:
             x = i - 0.4 + width * (j + 0.5)
             ax.bar(x, vals.median(), width * 0.9, color=COLORS[c], label=c if i == 0 else None)
             ax.scatter(np.full(len(vals), x), vals, s=8, color=INK_2, zorder=3, lw=0)
+    for i, q in enumerate(qs):  # chance: the fraction among all frequencies 1..q//2
+        chance = np.mean([np.gcd(k, q) > 1 for k in range(1, q // 2 + 1)])
+        ax.hlines(chance, i - 0.45, i + 0.45, colors="black", linestyles="--", lw=1.2, zorder=4,
+                  label="chance (random frequencies)" if i == 0 else None)
     ax.set_xticks(range(len(qs)), [str(q) for q in qs])
     ax.set(xlabel="composite target q", ylabel="fraction of key freqs with gcd(k,q)>1", ylim=(0, 1),
            title="Subgroup frequencies at the end of phase B")
