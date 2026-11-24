@@ -11,9 +11,10 @@ are enough to keep it busy.
 Several grid commands may work on the same experiment at the same time (e.g. two
 Slurm jobs on two GPUs, see ``cluster/``). Before running a job, a worker *claims*
 it by creating ``<run dir>/.claim`` (atomic, so only one worker wins). The others
-skip it. While the job runs, the claim file is touched every minute; a claim that
-has not been touched for 10 minutes belongs to a dead process (job killed or timed
-out) and is taken over. Transfer jobs wait for their source runs if another worker
+skip it. While the job runs, the claim file is touched every minute. A claim is
+dead, and taken over, if its Slurm job is no longer running (e.g. it hit the time
+limit: the next job of a chain redoes its unfinished runs right away), or if it has
+not been touched for 10 minutes. Transfer jobs wait for their source runs if another worker
 is still training them.
 """
 
@@ -21,7 +22,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import re
 import socket
+import subprocess
 import threading
 import time
 import traceback
@@ -82,18 +85,43 @@ def _claim_age(run_dir: Path) -> float | None:
         return None
 
 
+def _slurm_job_alive(job_id: str) -> bool | None:
+    """Is this Slurm job still running? None if Slurm cannot tell (e.g. no squeue here)."""
+    if job_id == os.environ.get("SLURM_JOB_ID"):
+        return True
+    try:
+        out = subprocess.run(["squeue", "-h", "-j", job_id, "-o", "%T"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return False if "Invalid job id" in out.stderr else None
+    return out.stdout.strip() in ("RUNNING", "PENDING", "CONFIGURING", "SUSPENDED", "REQUEUED", "RESIZING")
+
+
+def _claim_alive(run_dir: Path) -> bool:
+    """True if the claim of ``run_dir`` belongs to a live worker."""
+    age = _claim_age(run_dir)
+    if age is None or age >= STALE_S:
+        return False
+    try:
+        m = re.search(r"slurm_job=(\d+)", (run_dir / CLAIM).read_text())
+    except FileNotFoundError:
+        return False
+    if m and _slurm_job_alive(m.group(1)) is False:
+        return False  # its Slurm job ended (time limit, cancelled, crashed)
+    return True
+
+
 def is_claimed(run_dir: Path) -> bool:
     """True if a live worker (somewhere) is running this job."""
-    age = _claim_age(run_dir)
-    return age is not None and age < STALE_S
+    return _claim_alive(run_dir)
 
 
 def try_claim(run_dir: Path) -> bool:
     """Atomically claim a job. False if a live worker already owns it."""
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / CLAIM
-    age = _claim_age(run_dir)
-    if age is not None and age >= STALE_S:
+    if path.exists() and not _claim_alive(run_dir):
         path.unlink(missing_ok=True)  # the owner died: take over
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -173,8 +201,8 @@ def _report(i: int, n: int, job: Job, summary: dict | None, err: str | None, dt:
     tg = summary["T_grok"]
     status = f"T_grok={tg:>6d}" if tg is not None else f"not grokked in {summary['budget']}"
     extra = ""
-    if summary.get("forgetting") is not None:
-        extra = f"  forgetting={summary['forgetting']:+.2f}"
+    if summary.get("forgetting_disagree") is not None:  # forgetting on the pairs where the new rule is wrong
+        extra = f"  forgetting(disagree)={summary['forgetting_disagree']:+.2f}"
     speed = f"{summary['ms_per_step']:.2f} ms/step"
     print(f"[{i:>4d}/{n}] {job.label}  {status}  T_mem={summary['T_mem']}{extra}  ({dt:.0f}s, {speed})", flush=True)
 
@@ -185,7 +213,7 @@ def _wait_for_sources(cfg: ExperimentConfig, jobs: list[Job], poll_s: int = 30) 
     A source that is neither done nor claimed (e.g. it failed) is not waited for:
     the transfer jobs that need it will fail with a clear message.
     """
-    needed = {(j.p, j.seed) for j in jobs if CONDITIONS[j.condition].init != "scratch"}
+    needed = {(j.p, j.seed) for j in jobs if CONDITIONS[j.condition].needs_source}
     waited = False
     while True:
         running = [(p, s) for p, s in sorted(needed) if not is_done(source_dir(cfg, p, s)) and is_claimed(source_dir(cfg, p, s))]

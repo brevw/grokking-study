@@ -73,7 +73,7 @@ Follow Nanda et al. (2023) to stay close to a well-understood baseline:
 - 1-layer decoder-only transformer, `d_model = 128`, 4 heads (d_head = 32), MLP width 512, ReLU, learned positional embeddings, **no LayerNorm**, untied embed/unembed.
 - AdamW, lr `1e-3`, weight decay `1.0`, betas (0.9, 0.98), full-batch gradient descent, short linear warm-up (10 steps).
 - **At the start of phase B, reset the optimizer** (new AdamW state, same warm-up). This is the standard "warm-start" protocol, and it means the comparison with training from scratch differs only in the initial weights. Note this in the paper.
-- Step budget: phase A up to 30k steps; phase B up to **50k steps**. Runs that don't grok within the budget are **censored**, not dropped (Section 6).
+- Step budget: phase A up to 100k steps (+10k clean-up after T_grok); phase B up to **200k steps**, evaluated every 10 steps. Runs that don't grok within the budget are **censored**, not dropped (Section 6).
 
 Optional (only if time allows): repeat the main comparison with a 2-layer MLP (Gromov 2023) to check the result isn't architecture-specific.
 
@@ -102,16 +102,19 @@ For each target q, each seed, train on Z_q under these conditions (the first thr
 | ID | Name | Initial weights for phase B | Answers |
 |---|---|---|---|
 | **C0** | Scratch | random init | baseline grokking time `T_grok^scratch(q)` |
-| **C1** | Warm, grokked | network trained on Z_p **until grokked + 2k steps of cleanup** | RQ1, RQ5 |
-| **C2** | Warm, memorized | network trained on Z_p **until train acc ≥ 99% but val acc < 20%** | RQ2 |
+| **C1** | Warm, grokked | network trained on Z_p **until grokked + 10k steps of cleanup** | RQ1, RQ5 |
+| **C2** | Warm, memorized | Z_p network at the **end of the memorization plateau**: last checkpoint before T_grok with train acc ≥ 99% and val acc < 10% | RQ2 |
 | **C3** | Warm, grokked, permuted symbols | as C1, but phase B uses a random token permutation `π` | RQ3 |
 | C4 | Warm, grokked, re-init embeddings | as C1, but the embedding (and unembedding) rows are reset to random | where transfer lives: embeddings vs. the rest |
 | C5 (optional) | Joint training | train on Z_p ∪ Z_q from scratch (mix both datasets) | continual-learning upper reference (no ordering) |
 | C6 (optional) | Warm + ELR re-warm / shrink-and-perturb | as C1, plus a standard plasticity fix (Lyle et al. 2025, Ash & Adams 2020) | do continual-learning fixes help if C1 is slow? |
+| C7 | Norm-matched random init | random init, each weight matrix rescaled to its norm in the C1 start | is the speed-up structure, or just larger weights (effective LR)? |
+| C8 | Progress sweep | Z_p network at 10 / 25 / 50 / 75 / 100% of its T_grok | when does transferable structure appear during phase A? |
 
 Implementation notes:
 
-- C1 and C2 checkpoints come from the **same phase-A run** (save both moments). That keeps the source network the same between conditions.
+- C1, C2 and C8 checkpoints come from the **same phase-A run** (checkpoints every 250 steps, the needed ones are kept). That keeps the source network the same between conditions.
+- In warm starts, tokens never used in phase A (numbers ≥ p, `=q`) get **fresh random rows** (their phase-A rows decayed to ≈ 0 under weight decay, so all new symbols would otherwise start identical).
 - Use the **same seed for phase-B data split / permutation** across C0–C4. Then, for a given seed, the only difference between conditions is the starting weights.
 
 ---
@@ -136,7 +139,7 @@ Log **every 50 steps** (evaluation on the full train and val sets is cheap at th
 - `T_grok` = first step at which **val** acc ≥ 99% **and stays ≥ 99% for the next 1k steps** (to avoid counting spikes). Also report `T_95` (val ≥ 95%) as a less noisy alternative.
 - `Δ = T_grok − T_mem`: the grokking delay itself.
 - **Transfer ratio** `R = T_grok^scratch / T_grok^warm`, computed per seed pair. `R > 1` means the earlier training helped (positive transfer). `R < 1` means it hurt (primacy bias).
-- **Forgetting:** `F = acc_p(start of B) − acc_p(end of B)`, and `T_forget`, the step at which Z_p val acc falls below 50%. Also note whether `T_forget` comes before or after `T_grok(q)`.
+- **Forgetting:** `F = acc_p(start of B) − acc_p(end of B)`, and `T_forget`, the step at which Z_p val acc **on the disagree pairs** (where the mod-q answer differs) falls below 50%. On the agree pairs the old answer stays right for free, so overall Z_p accuracy ends near the agree fraction in every condition. Also note whether `T_forget` comes before or after `T_grok(q)`.
 
 ### 5.3 Representation metrics (cheap progress measures, computed from saved weights)
 
@@ -162,7 +165,7 @@ Optional, only if everything else is done: the restricted/excluded loss of Nanda
 
 ## 6. Statistics and reporting
 
-- **Seeds:** 5 seeds per (q, condition). The seed controls the init, the data split, and the permutation `π`.
+- **Seeds:** 20 seeds per (q, condition) (with 5, the smallest possible two-sided sign-test p-value is 0.0625). The seed controls the init, the data split, and the permutation `π`.
 - **Censoring:** runs that don't grok within the budget get `T_grok = budget` and are **marked as censored**. Report the fraction that grokked, and plot **survival curves** (fraction not yet grokked vs. step) per condition. These handle censoring correctly and are more informative than means.
 - **Summary statistic:** median `T_grok` with interquartile range, and the median transfer ratio `R` with a bootstrap 95% CI (resample seeds).
 - **Comparisons:** paired by seed (C1 vs C0 with the same phase-B split). A Wilcoxon signed-rank test, or just bootstrap CIs, is enough. Don't over-test, because the grid is small.

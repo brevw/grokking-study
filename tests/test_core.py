@@ -169,6 +169,18 @@ def test_key_frequencies_recover_planted_circles():
     assert fourier_sparsity(power, top=3) == pytest.approx(1.0)
 
 
+def test_fourier_power_counts_nyquist_like_other_frequencies():
+    """Equal energy at k = 1 and at the Nyquist frequency of even n gives equal power."""
+    n = 16
+    a = np.arange(n)
+    circle = np.stack([np.cos(2 * np.pi * a / n), np.sin(2 * np.pi * a / n)], axis=1)  # energy n
+    nyquist = np.stack([(-1.0) ** a, np.zeros(n)], axis=1)  # energy n
+    assert fourier_power(circle)[1] == pytest.approx(fourier_power(nyquist)[n // 2])
+    # and the power is proportional to the energy (Parseval)
+    E = np.random.default_rng(0).normal(size=(n, 3))
+    assert fourier_power(E).sum() == pytest.approx(n * (E**2).sum())
+
+
 def test_frequency_fit_r2():
     E = _clock_embedding(31, [4, 9])
     assert frequency_fit_r2(E, 31, [4, 9]) == pytest.approx(1.0)

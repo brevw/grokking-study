@@ -1,19 +1,65 @@
 {
   "name": "smoke",
   "out_root": "results",
-  "sources": [31],
-  "targets": {"31": [23, 37, 25, 31]},
-  "conditions": ["scratch", "warm_grokked", "warm_memorized", "warm_permuted",
-                 "warm_reinit_embed", "joint", "warm_shrink_perturb"],
-  "seeds": [0, 1],
-  "model": {"n_numbers": 40, "d_model": 64, "n_heads": 4, "d_mlp": 256, "n_layers": 1},
-  "task": {"op": "add", "train_frac": 0.6},
+  "sources": [
+    31
+  ],
+  "targets": {
+    "31": [
+      23,
+      37,
+      25,
+      31
+    ]
+  },
+  "conditions": [
+    "scratch",
+    "warm_grokked",
+    "warm_memorized",
+    "warm_permuted",
+    "warm_reinit_embed",
+    "joint",
+    "warm_shrink_perturb",
+    "scratch_norm_matched",
+    "warm_progress_10",
+    "warm_progress_25",
+    "warm_progress_50",
+    "warm_progress_75",
+    "warm_progress_100"
+  ],
+  "seeds": [
+    0,
+    1
+  ],
+  "model": {
+    "n_numbers": 40,
+    "d_model": 64,
+    "n_heads": 4,
+    "d_mlp": 256,
+    "n_layers": 1
+  },
+  "task": {
+    "op": "add",
+    "train_frac": 0.6
+  },
   "train_source": {
-    "lr": 0.01, "weight_decay": 1.0, "max_steps": 4000,
-    "eval_every": 50, "repr_every": 250, "grok_patience": 200, "stop_after_grok": 500
+    "lr": 0.01,
+    "weight_decay": 1.0,
+    "max_steps": 4000,
+    "eval_every": 50,
+    "repr_every": 250,
+    "grok_patience": 200,
+    "stop_after_grok": 500,
+    "checkpoint_every": 50
   },
   "train_transfer": {
-    "lr": 0.01, "weight_decay": 1.0, "max_steps": 4000,
-    "eval_every": 50, "repr_every": 250, "grok_patience": 200, "stop_after_grok": 300
-  }
+    "lr": 0.01,
+    "weight_decay": 1.0,
+    "max_steps": 4000,
+    "eval_every": 50,
+    "repr_every": 250,
+    "grok_patience": 200,
+    "stop_after_grok": 300
+  },
+  "mem_val_threshold": 0.5
 }

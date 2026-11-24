@@ -22,7 +22,7 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python run.py smoke --workers 4          # tiny full pipeline, ~2 min on an M1 Pro
 .venv/bin/python run.py conditions                 # list conditions C0..C6
-.venv/bin/python run.py grid configs/main.json --dry-run      # list the 145 jobs of the main grid
+.venv/bin/python run.py grid configs/main.json --dry-run      # list the 1840 jobs of the main grid
 .venv/bin/python run.py grid configs/main.json --workers 6    # run / resume the main grid
 .venv/bin/python run.py status  configs/main.json  # what is finished
 .venv/bin/python run.py analyze configs/main.json  # tables (printed + CSV)
@@ -47,8 +47,8 @@ Useful options:
 
 | File | What |
 |---|---|
-| `configs/main.json` | main grid: p = 97 → q ∈ {59, 89, 113, 91, 96, 121, 97}, conditions C0–C3, 5 seeds |
-| `configs/robustness.json` | second source prime: p = 59 → q ∈ {43, 71, 77, 81}, C0–C1, 5 seeds |
+| `configs/main.json` | main grid: p = 97 → q ∈ {59, 89, 113, 91, 96, 121, 97}, conditions C0–C8 (13), 20 seeds |
+| `configs/robustness.json` | second source prime: p = 59 → q ∈ {43, 71, 77, 81}, C0–C3 + C7, 20 seeds |
 | `configs/smoke.json` | toy version (p = 31, lr = 1e-2, d_model = 64) that groks in ~1k steps. **Only for testing the code.** Its numbers mean nothing. |
 
 **Compute.** Measured on the M1 Pro, the largest task (q = 113) costs ≈ 15–20 ms/step, so the
@@ -63,17 +63,18 @@ main grid is an overnight run on a laptop. On the cluster GPUs a step costs ≈ 
 ```bash
 cluster/cluster.sh setup                        # once: copy code, build .venv with CUDA PyTorch (~3 min)
 cluster/cluster.sh test                         # unit tests on a GPU node (~1 min, personal "dl" budget)
-cluster/cluster.sh submit configs/main.json     # 2 Slurm jobs (5060 Ti + 2080 Ti) sharing the grid
+cluster/cluster.sh submit configs/main.json --chain 3   # 3 jobs in a row (3 x 12 h), each resumes the last
 cluster/cluster.sh status configs/main.json     # jobs, GPU hours left, finished runs
 cluster/cluster.sh logs                         # follow the latest job
 cluster/cluster.sh fetch main                   # copy results/main back, then analyze/plot locally
 cluster/cluster.sh --host my-alias status       # a teammate's ssh alias
 ```
 
-* Jobs use the team account `dl_jobs` (480 GPU hours per team, 12 h max per job, 3 jobs per user).
-  `submit` starts one job per GPU type (`--gpus 5060ti,2080ti`). Every job runs `run.py grid`.
-  They split the runs between them through claim files (`grokking/grid.py`), so no run is done
-  twice, and a resubmitted job resumes where the last one stopped.
+* Jobs use the team account `dl_jobs` (480 GPU hours per team, 12 h max per job, 3 jobs submitted per user,
+  and the team runs **one job at a time**). For more than 12 h of work, `--chain N` submits N jobs that start one
+  after the other (`--dependency=afterany`). Every job runs `run.py grid`, which skips finished runs, so each
+  job resumes the last one. Runs cut off by the time limit are redone by the next job (claims of a finished Slurm
+  job are taken over, `grokking/grid.py`). Jobs with nothing left to do exit in seconds.
 * `--workers 2` (default): two runs share each GPU, which is enough to keep it busy.
 * GTX 1080 Ti nodes are not used: the CUDA 12.8 PyTorch build has no kernels for them.
   GB10 nodes are not used either: they have ARM CPUs.
@@ -120,7 +121,9 @@ tests/                  unit tests + an end-to-end pipeline test
 | Logits masked to the current group | `metrics.mask_logits` |
 | Same split for all conditions of a seed | `experiments.target_task` uses `stable_seed("split", "B", q, seed)` |
 | Fresh AdamW at the start of phase B | `train.Trainer.__init__` |
-| C1 = grokked + cleanup, C2 = at T_mem | `Trainer(save_memorized=True, save_final=True)`; `train_source.stop_after_grok` |
+| C1 = grokked + clean-up, C2 = end of the memorization plateau, C8 = XX% of T_grok | `experiments.select_checkpoints` (picks among `ckpt/step_*.pt`, saved every `train_source.checkpoint_every`); `mem_val_threshold`; `train_source.stop_after_grok` |
+| C7 = random init with the warm start's per-matrix norms | `experiments._initial_weights` (`norm_match`) |
+| new tokens (numbers ≥ p, `=q`) start from fresh random rows | `experiments._fresh_unseen_rows` (`fresh_unseen_rows`) |
 | T_mem, T_grok (sustained for `grok_patience`), T_95, T_forget | `metrics.SustainedCrossing`, `Trainer._update_trackers` |
 | Agree / disagree / new-token split of val acc | `ModularTask.overlap_masks` → columns `val_acc_agree/disagree/newtok` |
 | Effective learning rate ‖Δθ‖/‖θ‖ | `Trainer.fit` (column `elr` in `log.csv`) |
@@ -136,8 +139,11 @@ contains:
   `old_train_acc`, `old_val_acc`, `param_norm`, `elr`, `lr`
 * `repr.csv`: every `repr_every` steps: `key_freqs`, `fourier_sparsity`, `subgroup_frac`,
   `old_freq_r2`, `freq_match_dist`, `emb_cka_to_start`, `act_cka_to_start`, `dead_frac`, `rel_dist_from_start`
-* `summary.json`: `T_mem`, `T_grok`, `T_95`, `grokked`/`censored`, step-0 accuracies, `forgetting`, `T_forget`, timings
-* `memorized.pt`, `final.pt`: source runs only
+* `summary.json`: `T_mem`, `T_grok`, `T_95`, `grokked`/`censored`, step-0 accuracies, `forgetting` (all old pairs) and
+  `forgetting_agree/_disagree/_newtok`, `T_forget` (on the disagree pairs), timings. Source runs also record, for each
+  starting point, its step, val accuracy and Fourier sparsity (`memorized_step`, `progress_50_val_acc`, ...)
+* `final.pt`, `memorized.pt`, `progress_{10,25,50,75,100}.pt`: source runs only (the periodic `ckpt/` is deleted
+  after picking them, unless `keep_source_checkpoints`)
 
 `run.py analyze` writes `runs.csv` (all summaries), `table_conditions.csv` and `table_ratios.csv`.
 In a notebook:
@@ -152,8 +158,9 @@ res.condition_table(); res.transfer_ratios(); res.logs(p=97, q=113); res.repr_lo
 
 * **"Forgetting" includes the agreement set.** Under the identity map, Z_p and Z_q give the same answer
   whenever a + b < min(p, q). A scratch network learning Z_q therefore gets those Z_p pairs right "for free".
-  That is why scratch shows *negative* forgetting. Compare conditions to each other, and look at the
-  agree/disagree split.
+  That is why scratch shows *negative* forgetting, and why the old accuracy ends near 50% in every condition.
+  Use `forgetting_disagree` / `old_val_acc_disagree` (the old pairs where the new rule gives a different answer):
+  real forgetting shows there. `T_forget` is measured on those pairs.
 * **Representation metrics have a chance level.** Even random embeddings get a nonzero `old_freq_r2`
   (a least-squares fit with 2|K|+1 parameters). Always compare against the scratch condition.
 * **`old_freq_r2` uses all tokens 0..p-1.** The plan said tokens 0..min(p,q)-1. Using all p tokens keeps the Fourier

@@ -3,10 +3,13 @@
   "out_root": "results",
   "sources": [59],
   "targets": {"59": [43, 71, 77, 81]},
-  "conditions": ["scratch", "warm_grokked"],
-  "seeds": [0, 1, 2, 3, 4],
+  "conditions": ["scratch", "warm_grokked", "warm_memorized", "warm_permuted", "scratch_norm_matched"],
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
   "model": {"n_numbers": 128, "d_model": 128, "n_heads": 4, "d_mlp": 512, "n_layers": 1},
   "task": {"op": "add", "train_frac": 0.3},
-  "train_source": {"max_steps": 30000, "grok_patience": 1000, "stop_after_grok": 2000},
-  "train_transfer": {"max_steps": 50000, "grok_patience": 1000, "stop_after_grok": 1000}
+  "train_source": {
+    "max_steps": 100000, "eval_every": 50, "checkpoint_every": 250,
+    "grok_patience": 1000, "stop_after_grok": 10000
+  },
+  "train_transfer": {"max_steps": 200000, "eval_every": 10, "grok_patience": 1000, "stop_after_grok": 1000}
 }

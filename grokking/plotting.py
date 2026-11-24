@@ -8,7 +8,9 @@ Style rules:
   mean the same thing in every figure;
 * training time is on a log axis (grokking times vary by orders of magnitude);
 * median across seeds as a line, interquartile range as a band;
-* the new task Z_q is drawn solid and the old task Z_p dashed.
+* the new task Z_q is drawn solid and the old task Z_p dashed;
+* the per-pair figures show the main conditions; the progress sweep
+  (warm_progress_XX) has its own figure (``progress_p{p}.png``).
 """
 
 from __future__ import annotations
@@ -25,11 +27,14 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.ticker import NullFormatter  # noqa: E402
 
 from .analysis import Results  # noqa: E402
-from .conditions import CONDITION_ORDER  # noqa: E402
+from .conditions import MAIN_CONDITIONS, PROGRESS, PROGRESS_CONDITIONS  # noqa: E402
 
-# Categorical palette, assigned in fixed condition order (validated reference palette).
-_PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"]
-COLORS = dict(zip(CONDITION_ORDER, _PALETTE))
+# Categorical palette, assigned in fixed condition order. The norm-matched random
+# init is a control, so it gets a neutral grey.
+_PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#8c8c8c"]
+COLORS = dict(zip(MAIN_CONDITIONS, _PALETTE))
+# Progress sweep: one hue, light (early in phase A) to dark (at T_grok).
+COLORS.update(zip(PROGRESS_CONDITIONS, ["#f6c9b3", "#f2a27e", "#eb6834", "#b84a1d", "#7a2e10"]))
 INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
 plt.rcParams.update(
@@ -59,8 +64,9 @@ def is_prime(n: int) -> bool:
 
 
 def _conditions(df: pd.DataFrame) -> list[str]:
+    """Main conditions present in ``df``, in the fixed order (progress sweep excluded)."""
     present = set(df["condition"])
-    return [c for c in CONDITION_ORDER if c in present]
+    return [c for c in MAIN_CONDITIONS if c in present]
 
 
 def _median_band(df: pd.DataFrame, col: str) -> pd.DataFrame:
@@ -144,18 +150,33 @@ def plot_forgetting(res: Results, p: int, q: int, out: Path) -> Path | None:
     if logs.empty or "old_val_acc" not in logs:
         return None
     conds = _conditions(logs)
-    fig, axes = plt.subplots(1, len(conds), figsize=(3.2 * len(conds), 3), sharey=True, squeeze=False)
-    for ax, c in zip(axes[0], conds):
+    ncol = min(4, len(conds))
+    nrow = int(np.ceil(len(conds) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 2.8 * nrow), sharey=True, squeeze=False)
+    disagree = "old_val_acc_disagree" in logs and logs["old_val_acc_disagree"].notna().any()
+    for ax, c in zip(axes.flat, conds):
         d = logs[logs["condition"] == c]
         _band(ax, d, "val_acc", COLORS[c], None)
-        _band(ax, d, "old_val_acc", COLORS[c], None, ls="--")
+        if disagree:
+            _band(ax, d, "old_val_acc_disagree", COLORS[c], None, ls="--")
+            _band(ax, d, "old_val_acc", INK_2, None, ls=":")
+        else:
+            _band(ax, d, "old_val_acc", COLORS[c], None, ls="--")
         _logx(ax)
         ax.set(ylim=(-0.02, 1.02), xlabel="phase-B step", title=c)
-    axes[0][0].set_ylabel("validation accuracy")
+    for ax in list(axes.flat)[len(conds):]:
+        ax.set_visible(False)
+    for row in axes:
+        row[0].set_ylabel("validation accuracy")
     # One shared legend for the line styles (colour = condition, given by the titles).
-    handles = [Line2D([], [], color=INK_2, ls="-", label=f"new task Z_{q}"),
-               Line2D([], [], color=INK_2, ls="--", label=f"old task Z_{p}")]
-    fig.legend(handles=handles, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.08))
+    handles = [Line2D([], [], color=INK_2, ls="-", label=f"new task Z_{q}")]
+    if disagree:
+        handles += [Line2D([], [], color=INK_2, ls="--", label=f"old task Z_{p}, pairs where mod {q} is wrong"),
+                    Line2D([], [], color=INK_2, ls=":", label=f"old task Z_{p}, all pairs")]
+    else:
+        handles += [Line2D([], [], color=INK_2, ls="--", label=f"old task Z_{p}")]
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.02 + 0.04 / nrow))
+    fig.tight_layout()
     return _save(fig, out / f"forgetting_p{p}_q{q}.png")
 
 
@@ -286,6 +307,59 @@ def plot_subgroup_frequencies(res: Results, out: Path) -> Path | None:
     return _save(fig, out / "subgroup_frequencies.png")
 
 
+def plot_progress(res: Results, out: Path) -> list[Path]:
+    """Transfer vs. how far phase A had progressed when phase B started.
+
+    One panel per target q: transfer ratio R (median, 95% CI, one dot per seed) for a
+    start at 0% (scratch, R = 1), 10..100% of the source's T_grok, and after clean-up
+    (warm_grokked). Last panel: the source network at those points, its val accuracy
+    and its Fourier sparsity (does the clock structure appear before val acc jumps?).
+    """
+    table = res.progress_table()
+    paths: list[Path] = []
+    if table.empty:
+        return paths
+    paired = res.paired_ratios()
+    labels = ["0"] + [f"{pct}%" for pct in PROGRESS] + ["final"]
+    xpos = {pct: i + 1 for i, pct in enumerate(PROGRESS)} | {"final": len(PROGRESS) + 1}
+    cond_of = {pct: f"warm_progress_{pct}" for pct in PROGRESS} | {"final": "warm_grokked"}
+    for p, tp in table.groupby("p"):
+        qs = sorted(tp["q"].unique(), key=lambda q: (q == p, not is_prime(q), q < p, q))
+        n = len(qs) + 1
+        ncol = min(4, n)
+        nrow = int(np.ceil(n / ncol))
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.3 * ncol, 2.8 * nrow), squeeze=False)
+        for ax, q in zip(axes.flat, qs):
+            t = tp[tp["q"] == q]
+            x = [0] + [xpos[v] for v in t["progress"]]
+            ax.plot(x, [1.0] + list(t["R_median"]), color=COLORS["warm_grokked"], marker="o", ms=4)
+            ax.vlines([xpos[v] for v in t["progress"]], t["R_ci_low"], t["R_ci_high"], color=COLORS["warm_grokked"], lw=1.2)
+            for v in t["progress"]:
+                s = paired[(paired["p"] == p) & (paired["q"] == q) & (paired["condition"] == cond_of[v])]
+                ax.scatter(np.full(len(s), xpos[v] + 0.15), s["R"], s=6, color=INK_2, alpha=0.4, lw=0)
+            ax.axhline(1.0, color=INK_2, lw=1, ls=":")
+            kind = "same" if q == p else ("prime" if is_prime(q) else "composite")
+            ax.set(yscale="log", title=f"Z_{p} → Z_{q} ({kind})")
+            ax.set_xticks(range(len(labels)), labels, fontsize=7)
+        for i in range(0, len(qs), ncol):
+            axes.flat[i].set_ylabel("R = T_grok(scratch) / T_grok")
+        # Source state along phase A.
+        ax = axes.flat[len(qs)]
+        t = tp.drop_duplicates("progress")
+        x = [xpos[v] for v in t["progress"]]
+        ax.plot(x, t["source_val_acc"], color=COLORS["scratch"], marker="o", ms=4, label="val accuracy")
+        ax.plot(x, t["source_sparsity"], color=COLORS["warm_permuted"], marker="o", ms=4, label="Fourier sparsity")
+        ax.set_xticks(range(len(labels)), labels, fontsize=7)
+        ax.set(ylim=(-0.02, 1.02), title=f"source Z_{p} at that point")
+        ax.legend(fontsize=7, loc="upper left")
+        for ax in list(axes.flat)[n:]:
+            ax.set_visible(False)
+        fig.supxlabel("phase-A checkpoint (% of the source's T_grok)", fontsize=9)
+        fig.tight_layout()
+        paths.append(_save(fig, out / f"progress_p{p}.png"))
+    return paths
+
+
 # ------------------------------------------------------------------------ all
 
 
@@ -295,6 +369,7 @@ def make_all_figures(exp_dir: str | Path) -> list[Path]:
     paths: list[Path | None] = [plot_source_curves(res, out)]
     if len(res.transfers):
         paths += plot_transfer_ratios(res, out)
+        paths += plot_progress(res, out)
         paths.append(plot_subgroup_frequencies(res, out))
         for (p, q), _ in res.transfers.groupby(["p", "q"]):
             for fn in (plot_transfer_curves, plot_forgetting, plot_overlap, plot_representation, plot_survival):

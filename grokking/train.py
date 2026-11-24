@@ -10,23 +10,25 @@ the trainer:
 * ``eval_tasks``   extra tasks to monitor (e.g. ``{"old": Z_p}`` to measure forgetting),
 * ``val_masks``    boolean masks over the primary task, used to split val accuracy
                    (agree / disagree / newtok),
-* ``old``          phase-A info used by the old-frequency retention metric.
+* ``eval_masks``   the same for each extra task (e.g. the old task's disagree pairs),
+* ``old``          phase-A info used by the old-frequency retention metric,
+* ``on_finish``    optional hook ``f(trainer, summary)`` called before summary.json is
+                   written (phase A uses it to pick its checkpoints).
 
 Files written to ``out_dir``::
 
     log.csv        one row every eval_every steps (behavioural metrics)
     repr.csv       one row every repr_every steps (representation metrics)
     summary.json   timings and final numbers of the run (the input of analysis.py)
-    memorized.pt   weights at T_mem          (if save_memorized)
     final.pt       weights at the end        (if save_final)
-    ckpt/step_*.pt periodic weights          (if cfg.save_checkpoints)
+    ckpt/step_*.pt periodic weights          (if cfg.checkpoint_every > 0)
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -50,6 +52,10 @@ def masked_loss(model: GrokTransformer, x: torch.Tensor, y: torch.Tensor, invali
     return F.cross_entropy(logits, y)
 
 
+# Logs are written at the end of a run, and every FLUSH_EVERY steps to follow long runs.
+FLUSH_EVERY = 10_000
+
+
 class Trainer:
     def __init__(
         self,
@@ -60,10 +66,11 @@ class Trainer:
         out_dir: str | Path,
         eval_tasks: dict[str, ModularTask] | None = None,
         val_masks: dict[str, np.ndarray] | None = None,
+        eval_masks: dict[str, dict[str, np.ndarray]] | None = None,
         old: OldTaskInfo | None = None,
-        save_memorized: bool = False,
         save_final: bool = False,
         run_info: dict[str, Any] | None = None,
+        on_finish: Callable[["Trainer", dict[str, Any]], None] | None = None,
     ):
         self.cfg = cfg
         self.device = resolve_device(cfg.device)
@@ -73,9 +80,9 @@ class Trainer:
         self.eval_tasks = eval_tasks or {}
         self.val_masks = val_masks or {}
         self.old = old
-        self.save_memorized = save_memorized
         self.save_final = save_final
         self.run_info = run_info or {}
+        self.on_finish = on_finish
 
         # Full-batch training data: concatenation of the train splits of all train tasks.
         self.x = torch.cat([t.tokens[t.train_idx] for t in train_tasks]).to(self.device)
@@ -87,7 +94,10 @@ class Trainer:
 
         # Evaluators keep each task's tensors on the device.
         self.eval_primary = TaskEvaluator(primary, self.device, val_subsets=self.val_masks)
-        self.eval_extra = {name: TaskEvaluator(t, self.device) for name, t in self.eval_tasks.items()}
+        eval_masks = eval_masks or {}
+        self.eval_extra = {
+            name: TaskEvaluator(t, self.device, val_subsets=eval_masks.get(name)) for name, t in self.eval_tasks.items()
+        }
 
         # GPU speed-ups (see TrainConfig): torch.compile of the training forward pass,
         # and replaying the whole training step as one CUDA graph. Evaluation always
@@ -224,6 +234,8 @@ class Trainer:
             if step % cfg.eval_every == 0 or is_last:
                 row = self._evaluate(step)
                 self._update_trackers(step, row)
+                if cfg.checkpoint_every and step % cfg.checkpoint_every == 0:
+                    self._save(f"ckpt/step_{step}.pt")  # the weights this log row describes
 
                 stop = is_last or self._should_stop(step)
                 if step % cfg.repr_every == 0 or stop:
@@ -231,9 +243,8 @@ class Trainer:
                     if ref is None:  # reference = the network at the start of this run (step 0)
                         ref = make_reference(self.model, self.primary, hidden)
                     self.repr_log.append({"step": step, **snapshot(self.model, self.primary, hidden, ref, self.old)})
-                    if cfg.save_checkpoints:
-                        self._save(f"ckpt/step_{step}.pt")
-                    self._flush()
+                if step % FLUSH_EVERY == 0:
+                    self._flush()  # partial logs, to follow long runs
                 if cfg.print_every and step % cfg.print_every == 0:
                     self._print(step, row)
                 if stop:
@@ -255,7 +266,9 @@ class Trainer:
             self._save("final.pt")
         summary = self._summary(step, wall)
         self._flush()
-        write_json(self.out_dir / "summary.json", summary)
+        if self.on_finish is not None:
+            self.on_finish(self, summary)
+        write_json(self.out_dir / "summary.json", summary)  # last: marks the run as done
         return summary
 
     # ---------------------------------------------------------------- helpers
@@ -264,14 +277,13 @@ class Trainer:
         was_memorized = self.t_mem.confirmed
         self.t_mem.update(step, row["train_acc"])
         if self.t_mem.confirmed and not was_memorized:
-            # Checkpoint for the "warm_memorized" condition (C2).
             self.extra_summary["val_acc_at_mem"] = row["val_acc"]
-            if self.save_memorized:
-                self._save("memorized.pt")
         self.t_grok.update(step, row["val_acc"])
         self.t_95.update(step, row["val_acc"])
-        if "old_val_acc" in row:
-            self.t_forget.update(step, row["old_val_acc"])
+        # Forgetting is timed on the old pairs where the new rule gives a *different*
+        # answer: on the other pairs, learning Z_q keeps the old answer right for free.
+        if "old_val_acc_disagree" in row:
+            self.t_forget.update(step, row["old_val_acc_disagree"])
 
     def _should_stop(self, step: int) -> bool:
         if self.cfg.stop_after_grok is None or not self.t_grok.confirmed:
@@ -315,9 +327,14 @@ class Trainer:
         for key in ("val_acc_agree", "val_acc_disagree", "val_acc_newtok"):
             if key in first:
                 s[f"step0_{key}"] = first[key]
+        # Forgetting = old-task val acc at the start of phase B minus at the end: on all
+        # old pairs, and separately on the agree / disagree / newtok pairs.
+        for suffix in ("", "_agree", "_disagree", "_newtok"):
+            key = f"old_val_acc{suffix}"
+            if key in first:
+                s[f"{key}_start"] = first[key]
+                s[f"{key}_end"] = last[key]
+                s[f"forgetting{suffix}"] = first[key] - last[key]
         if "old_val_acc" in first:
-            s["old_val_acc_start"] = first["old_val_acc"]
-            s["old_val_acc_end"] = last["old_val_acc"]
-            s["forgetting"] = first["old_val_acc"] - last["old_val_acc"]
             s["T_forget"] = self.t_forget.step
         return s

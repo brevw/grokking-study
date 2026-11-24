@@ -5,7 +5,7 @@ Timing definitions (PROJECT_PLAN.md, Section 5.2):
 * ``T_mem``    first step with train acc >= 0.99
 * ``T_grok``   first step with val acc >= 0.99 that *stays* >= 0.99 for ``patience`` steps
 * ``T_95``     same with threshold 0.95
-* ``T_forget`` first step at which the old task's val acc drops below 0.5
+* ``T_forget`` first step at which the old task's val acc on the "disagree" pairs drops below 0.5
 
 All of them share the same "sustained crossing" logic, implemented once in
 ``SustainedCrossing``. It is used online (to stop training) and offline (to

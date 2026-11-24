@@ -3,7 +3,8 @@
 Directory layout of an experiment ``results/<name>/``::
 
     config.json                                   the experiment config
-    source/p97/s0/        log.csv repr.csv summary.json memorized.pt final.pt
+    source/p97/s0/        log.csv repr.csv summary.json
+                          final.pt memorized.pt progress_10.pt ... progress_100.pt
     transfer/p97_q113/warm_grokked/s0/   log.csv repr.csv summary.json
 
 Seeding (all seeds derived with ``utils.stable_seed``):
@@ -20,16 +21,17 @@ so a grid can be interrupted and resumed at any time.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from .conditions import CONDITIONS, Condition
+from .conditions import CONDITIONS, PROGRESS, Condition
 from .config import ExperimentConfig
-from .data import ModularTask
+from .data import ModularTask, eq_token
 from .model import GrokTransformer
-from .representation import OldTaskInfo
+from .representation import OldTaskInfo, fourier_power, fourier_sparsity
 from .train import Trainer
 from .utils import read_json, set_seed, stable_seed
 
@@ -86,7 +88,11 @@ def new_model(cfg: ExperimentConfig, init_seed: int) -> GrokTransformer:
 
 
 def run_source(cfg: ExperimentConfig, p: int, seed: int, force: bool = False, verbose: bool = False) -> dict[str, Any]:
-    """Train on Z_p from scratch until grokked (+ cleanup). Saves memorized.pt and final.pt."""
+    """Train on Z_p from scratch until grokked (+ clean-up).
+
+    Saves ``final.pt`` and, picked from the periodic checkpoints, the starting points
+    of phase B: ``memorized.pt`` and ``progress_XX.pt`` (see ``select_checkpoints``).
+    """
     out = source_dir(cfg, p, seed)
     if is_done(out) and not force:
         return read_json(out / "summary.json")
@@ -102,21 +108,75 @@ def run_source(cfg: ExperimentConfig, p: int, seed: int, force: bool = False, ve
         primary=task,
         cfg=cfg.train_source,
         out_dir=out,
-        save_memorized=True,
         save_final=True,
         run_info={"kind": "source", "p": p, "q": p, "condition": "source", "seed": seed},
+        on_finish=lambda tr, summary: select_checkpoints(cfg, p, out, tr.log, summary),
     )
     return trainer.fit()
+
+
+def select_checkpoints(cfg: ExperimentConfig, p: int, out: Path, log: list[dict], summary: dict) -> None:
+    """Pick the phase-B starting points among the phase-A checkpoints ``ckpt/step_*.pt``.
+
+    * ``memorized.pt``: end of the memorization plateau = the last checkpoint before
+      T_grok with train acc >= grok_threshold and val acc < cfg.mem_val_threshold.
+    * ``progress_XX.pt``: the checkpoint closest to XX% of T_grok (only if grokked).
+
+    Adds to ``summary``, for each of them, the step, the val accuracy and the Fourier
+    sparsity of the embedding (how much "clock" structure is already there), e.g.
+    ``memorized_step``, ``progress_50_val_acc``, ``progress_50_sparsity``. Then deletes
+    the periodic checkpoints unless cfg.keep_source_checkpoints.
+    """
+    ckpt_dir = out / "ckpt"
+    saved = sorted(int(f.stem.split("_")[1]) for f in ckpt_dir.glob("step_*.pt"))
+    rows = {r["step"]: r for r in log}
+    t_grok = summary["T_grok"]
+
+    def keep(name: str, step: int) -> None:
+        shutil.copyfile(ckpt_dir / f"step_{step}.pt", out / f"{name}.pt")
+        W = torch.load(out / f"{name}.pt", map_location="cpu")["embed.weight"][:p].numpy()
+        summary[f"{name}_step"] = step
+        summary[f"{name}_val_acc"] = rows[step]["val_acc"]
+        summary[f"{name}_sparsity"] = fourier_sparsity(fourier_power(W))
+
+    limit = t_grok if t_grok is not None else saved[-1]
+    plateau = [
+        s
+        for s in saved
+        if s <= limit
+        and rows[s]["train_acc"] >= cfg.train_source.grok_threshold
+        and rows[s]["val_acc"] < cfg.mem_val_threshold
+    ]
+    if plateau:
+        keep("memorized", plateau[-1])
+    if t_grok is not None:
+        for pct in PROGRESS:
+            keep(f"progress_{pct}", min(saved, key=lambda s: abs(s - pct / 100 * t_grok)))
+    if not cfg.keep_source_checkpoints:
+        shutil.rmtree(ckpt_dir)
 
 
 # --------------------------------------------------------------------- phase B
 
 
+def _fresh_unseen_rows(cfg: ExperimentConfig, model: GrokTransformer, fresh: dict, p: int) -> None:
+    """Give the tokens never used in phase A (numbers >= p, and "=q") their scratch-init rows.
+
+    In phase A their embedding and unembedding rows get no gradient, so weight decay
+    shrinks them to ~0: without this, all new symbols would start identical.
+    """
+    V = cfg.model.n_numbers
+    with torch.no_grad():
+        model.embed.weight[p:V] = fresh["embed.weight"][p:V]
+        model.embed.weight[eq_token(1, V)] = fresh["embed.weight"][eq_token(1, V)]
+        model.unembed.weight[p:V] = fresh["unembed.weight"][p:V]
+
+
 def _initial_weights(cfg: ExperimentConfig, cond: Condition, p: int, q: int, seed: int) -> tuple[GrokTransformer, dict]:
     """Build the phase-B starting network for a condition. Returns (model, info for the summary)."""
     info: dict[str, Any] = {}
-    model = new_model(cfg, stable_seed("init", "B", q, seed))  # scratch init (also used by S&P)
-    if cond.init == "scratch":
+    model = new_model(cfg, stable_seed("init", "B", q, seed))  # scratch init (also used by S&P and fresh rows)
+    if not cond.needs_source:
         return model, info
 
     src = source_dir(cfg, p, seed)
@@ -126,14 +186,18 @@ def _initial_weights(cfg: ExperimentConfig, cond: Condition, p: int, q: int, see
     info["source_grokked"] = src_summary["grokked"]
     info["source_T_grok"] = src_summary["T_grok"]
 
-    ckpt = {"grokked": "final.pt", "memorized": "memorized.pt"}[cond.init]
-    if not (src / ckpt).exists():
-        raise FileNotFoundError(
-            f"{src / ckpt} missing: the source run never reached train acc >= threshold "
-            f"(T_mem={src_summary['T_mem']}), so there is no memorized checkpoint. Increase train_source.max_steps."
+    stem = "final" if cond.norm_match else cond.init
+    if not (src / f"{stem}.pt").exists():
+        why = (
+            f"no checkpoint with train acc >= {cfg.train_source.grok_threshold} and val acc < {cfg.mem_val_threshold}"
+            if stem == "memorized"
+            else "the source run did not grok, so it has no progress checkpoints"
         )
+        raise FileNotFoundError(f"{src / f'{stem}.pt'} missing: {why}.")
     fresh = {k: v.clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(torch.load(src / ckpt, map_location="cpu"))
+    model.load_state_dict(torch.load(src / f"{stem}.pt", map_location="cpu"))
+    info["source_checkpoint"] = stem
+    info["source_checkpoint_step"] = src_summary.get(f"{stem}_step", src_summary["steps_run"])
 
     if cond.reinit_embeddings:
         g = torch.Generator().manual_seed(stable_seed("reinit", q, seed))
@@ -143,6 +207,16 @@ def _initial_weights(cfg: ExperimentConfig, cond: Condition, p: int, q: int, see
             for name, param in model.named_parameters():
                 param.mul_(cfg.shrink).add_(cfg.perturb * fresh[name])
         info.update(shrink=cfg.shrink, perturb=cfg.perturb)
+    if cfg.fresh_unseen_rows and not cond.reinit_embeddings:  # (reinit already gives fresh rows)
+        _fresh_unseen_rows(cfg, model, fresh, p)
+        info["fresh_unseen_rows"] = True
+    if cond.norm_match:
+        # The random init, each weight matrix rescaled to the norm it has in the warm start.
+        warm = {k: v.clone() for k, v in model.state_dict().items()}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                param.copy_(fresh[name] * (warm[name].norm() / fresh[name].norm()))
+        info["norm_matched_to"] = stem
     return model, info
 
 
@@ -182,6 +256,9 @@ def run_transfer(
         out_dir=out,
         eval_tasks={"old": old},
         val_masks=new.overlap_masks(p),
+        # Old pairs split by what the *new* rule (mod q) answers: right ("agree"),
+        # wrong ("disagree": real forgetting shows here), or tokens >= q ("newtok").
+        eval_masks={"old": old.overlap_masks(q)},
         old=old_info,
         run_info={"kind": "transfer", "p": p, "q": q, "condition": condition, "seed": seed, **info},
     )

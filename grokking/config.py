@@ -75,7 +75,9 @@ class TrainConfig:
     max_steps: int = 30_000
     eval_every: int = 50  # behavioural metrics (cheap)
     repr_every: int = 500  # representation metrics (Fourier, CKA, ...)
-    save_checkpoints: bool = False  # also dump weights every repr_every steps
+    # Save the weights every k steps to ckpt/step_*.pt (0 = never). Phase A needs them
+    # to pick the "memorized" and "progress" starting points of phase B.
+    checkpoint_every: int = 0
 
     # --- grokking detection ---
     # T_grok = first step with val acc >= grok_threshold that *stays* there for
@@ -117,12 +119,32 @@ class ExperimentConfig:
     conditions: list[str] = field(
         default_factory=lambda: ["scratch", "warm_grokked", "warm_memorized", "warm_permuted"]
     )
-    seeds: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+    seeds: list[int] = field(default_factory=lambda: list(range(20)))
 
     model: ModelConfig = field(default_factory=ModelConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
-    train_source: TrainConfig = field(default_factory=lambda: TrainConfig(max_steps=30_000, stop_after_grok=2000))
-    train_transfer: TrainConfig = field(default_factory=lambda: TrainConfig(max_steps=50_000, stop_after_grok=1000))
+    # Phase A: long budget (some seeds need > 30k steps), long clean-up after grokking
+    # (the circuit keeps getting cleaner after val acc reaches 100%), and checkpoints
+    # every 250 steps (to pick the memorized / progress starting points).
+    train_source: TrainConfig = field(
+        default_factory=lambda: TrainConfig(max_steps=100_000, stop_after_grok=10_000, checkpoint_every=250)
+    )
+    # Phase B: long budget (few censored runs) and fine time resolution (warm starts
+    # grok within a few hundred steps).
+    train_transfer: TrainConfig = field(
+        default_factory=lambda: TrainConfig(max_steps=200_000, stop_after_grok=1000, eval_every=10)
+    )
+
+    # warm_memorized starts from the last phase-A checkpoint before T_grok whose val
+    # accuracy is still below this value (end of the memorization plateau).
+    mem_val_threshold: float = 0.1
+    # Keep all phase-A checkpoints (ckpt/step_*.pt, ~1 MB each) after picking the
+    # starting points. False: delete them to save disk space.
+    keep_source_checkpoints: bool = False
+    # Warm starts: rows of tokens never used in phase A (numbers >= p and "=q") have
+    # decayed to ~0 under weight decay. True: replace them by fresh random rows (the
+    # scratch init), so new symbols do not all start identical.
+    fresh_unseen_rows: bool = True
 
     # Parameters of the shrink-and-perturb condition (Ash & Adams, 2020):
     # theta <- shrink * theta + perturb * theta_fresh_init
@@ -165,9 +187,13 @@ class ExperimentConfig:
             tc: TrainConfig = getattr(self, name)
             if tc.repr_every % tc.eval_every:
                 raise ValueError(f"{name}.repr_every must be a multiple of {name}.eval_every")
+            if tc.checkpoint_every % tc.eval_every:
+                raise ValueError(f"{name}.checkpoint_every must be a multiple of {name}.eval_every")
             for flag in ("compile", "cuda_graph"):
                 if getattr(tc, flag) not in (True, False, "auto"):
                     raise ValueError(f'{name}.{flag} must be true, false or "auto"')
+        if self.train_source.checkpoint_every <= 0:
+            raise ValueError("train_source.checkpoint_every must be > 0 (phase B starts from phase-A checkpoints)")
 
     # ------------------------------------------------------------- (de)serialise
 

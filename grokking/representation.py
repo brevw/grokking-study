@@ -35,10 +35,19 @@ def group_embedding(W_E: np.ndarray, symbols: np.ndarray) -> np.ndarray:
 def fourier_power(E: np.ndarray) -> np.ndarray:
     """Power per frequency k = 0..n//2, summed over embedding dimensions.
 
-    ``E`` has shape (n, d). Returns an array of shape (n//2 + 1,).
+    ``E`` has shape (n, d). Returns an array of shape (n//2 + 1,), proportional to the
+    share of the embedding's energy (Σ_a ||E[a]||²) in each frequency (Parseval).
+
+    The real DFT stores frequency k and n-k in a single bin, so each bin 0 < k < n/2
+    counts twice. For even n, the Nyquist bin k = n/2 (the ±1 pattern) has no partner
+    and counts once. Without this weighting the Nyquist frequency of even n (Z_96) would
+    be under-counted by a factor 2 relative to the others.
     """
+    n = E.shape[0]
     coeffs = np.fft.rfft(E, axis=0)  # (n//2+1, d)
-    return (np.abs(coeffs) ** 2).sum(axis=1)
+    power = (np.abs(coeffs) ** 2).sum(axis=1)
+    power[1 : (n + 1) // 2] *= 2  # paired frequencies (excludes k = 0 and, for even n, k = n/2)
+    return power
 
 
 def key_frequencies(power: np.ndarray, mass: float = 0.9, max_freqs: int | None = None) -> list[int]:

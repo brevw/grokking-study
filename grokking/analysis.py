@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .conditions import CONDITION_ORDER
+from .conditions import CONDITION_ORDER, PROGRESS
 from .utils import read_json
 
 KEYS = ["p", "q", "condition", "seed"]
@@ -146,10 +146,47 @@ class Results:
                 "step0_val_acc": g["step0_val_acc"].mean(),
             }
         )
-        for col in ("forgetting", "T_forget", "step0_val_acc_agree", "step0_val_acc_disagree"):
+        for col in ("forgetting", "forgetting_disagree", "T_forget", "step0_val_acc_agree", "step0_val_acc_disagree"):
             if col in df:
-                out[col if col != "forgetting" else "forgetting_med"] = g[col].median()
+                out[col + "_med" if col.startswith("forgetting") else col] = g[col].median()
         return _order_conditions(out.reset_index())
+
+    def progress_table(self) -> pd.DataFrame:
+        """Transfer vs. how far phase A had progressed (the warm_progress_XX conditions).
+
+        One row per (p, q, progress %): the transfer ratio (median, CI) and, for the
+        source checkpoints at that point, the median val accuracy and Fourier sparsity.
+        ``progress`` 0 is scratch (R = 1) and ``final`` is warm_grokked (after clean-up).
+        """
+        rt = self.transfer_ratios()
+        if rt.empty:
+            return pd.DataFrame()
+        src = self.sources
+        rows = []
+        points = [(pct, f"warm_progress_{pct}", f"progress_{pct}") for pct in PROGRESS]
+        points.append(("final", "warm_grokked", None))
+        for (p, q), r in rt.groupby(["p", "q"]):
+            s = src[src["p"] == p]
+            for pct, cond, key in points:
+                hit = r[r["condition"] == cond]
+                if hit.empty:
+                    continue
+                h = hit.iloc[0]
+                rows.append(
+                    {
+                        "p": p,
+                        "q": q,
+                        "progress": pct,
+                        "R_median": h["R_median"],
+                        "R_ci_low": h["R_ci_low"],
+                        "R_ci_high": h["R_ci_high"],
+                        "sign_test_p": h["sign_test_p"],
+                        "n_censored": h["n_censored"],
+                        "source_val_acc": s[f"{key}_val_acc"].median() if key and f"{key}_val_acc" in s else s["final_val_acc"].median(),
+                        "source_sparsity": s[f"{key}_sparsity"].median() if key and f"{key}_sparsity" in s else s["final_fourier_sparsity"].median(),
+                    }
+                )
+        return pd.DataFrame(rows)
 
     def transfer_ratios(self, baseline: str = "scratch") -> pd.DataFrame:
         """Paired transfer ratio R = T_grok(baseline) / T_grok(condition) per seed, then aggregated.
@@ -235,7 +272,7 @@ class Results:
 
         if len(self.transfers):
             cols = ["p", "q", "condition", "n_runs", "frac_grokked", "T_mem_med", "T_grok_med", "delay_med",
-                    "step0_val_acc", "forgetting_med"]
+                    "step0_val_acc", "forgetting_med", "forgetting_disagree_med"]
             ct = self.condition_table()
             ct = ct[ct["condition"] != "source"]
             parts += ["", "--- Phase B: per condition (T_grok of censored runs = budget) ---",
@@ -244,10 +281,16 @@ class Results:
             if len(rt):
                 parts += ["", "--- Transfer ratio R = T_grok(scratch) / T_grok(condition)  (R>1: faster than scratch) ---",
                           rt.to_string(index=False, float_format=lambda x: f"{x:.3g}")]
+            pt = self.progress_table()
+            if len(pt):
+                parts += ["", "--- Transfer vs. progress of phase A (0 = scratch, final = grokked + clean-up) ---",
+                          pt.to_string(index=False, float_format=lambda x: f"{x:.3g}")]
             if save:
                 ct.to_csv(self.exp_dir / "table_conditions.csv", index=False)
                 rt.to_csv(self.exp_dir / "table_ratios.csv", index=False)
+                if len(pt):
+                    pt.to_csv(self.exp_dir / "table_progress.csv", index=False)
         if save:
             self.summaries.to_csv(self.exp_dir / "runs.csv", index=False)
-            parts += ["", f"Tables written to {self.exp_dir}/(runs|table_conditions|table_ratios).csv"]
+            parts += ["", f"Tables written to {self.exp_dir}/(runs|table_conditions|table_ratios|table_progress).csv"]
         return "\n".join(parts)

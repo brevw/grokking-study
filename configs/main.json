@@ -3,18 +3,25 @@
   "out_root": "results",
   "sources": [97],
   "targets": {"97": [59, 89, 113, 91, 96, 121, 97]},
-  "conditions": ["scratch", "warm_grokked", "warm_memorized", "warm_permuted"],
-  "seeds": [0, 1, 2, 3, 4],
+  "conditions": [
+    "scratch", "warm_grokked", "warm_memorized", "warm_permuted",
+    "warm_reinit_embed", "joint", "warm_shrink_perturb", "scratch_norm_matched",
+    "warm_progress_10", "warm_progress_25", "warm_progress_50", "warm_progress_75", "warm_progress_100"
+  ],
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
   "model": {"n_numbers": 128, "d_model": 128, "n_heads": 4, "d_mlp": 512, "n_layers": 1},
   "task": {"op": "add", "train_frac": 0.3},
   "train_source": {
-    "lr": 0.001, "weight_decay": 1.0, "max_steps": 50000,
-    "eval_every": 50, "repr_every": 500,
-    "grok_threshold": 0.99, "grok_patience": 1000, "stop_after_grok": 2000
+    "lr": 0.001, "weight_decay": 1.0, "max_steps": 100000,
+    "eval_every": 50, "repr_every": 500, "checkpoint_every": 250,
+    "grok_threshold": 0.99, "grok_patience": 1000, "stop_after_grok": 10000
   },
   "train_transfer": {
-    "lr": 0.001, "weight_decay": 1.0, "max_steps": 50000,
-    "eval_every": 50, "repr_every": 500,
+    "lr": 0.001, "weight_decay": 1.0, "max_steps": 200000,
+    "eval_every": 10, "repr_every": 500,
     "grok_threshold": 0.99, "grok_patience": 1000, "stop_after_grok": 1000
-  }
+  },
+  "mem_val_threshold": 0.1,
+  "fresh_unseen_rows": true,
+  "keep_source_checkpoints": false
 }
